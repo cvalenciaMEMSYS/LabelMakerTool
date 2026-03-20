@@ -24,7 +24,7 @@ class ZebraLabelPrinter:
     def __init__(self, root):
         self.root = root
         self.root.title("MEMSYS - Zebra Label Printer")
-        self.root.geometry("800x600")
+        self.root.geometry("600x700")
         self.root.resizable(True, True)
         self.root.minsize(400, 450)
         
@@ -33,6 +33,7 @@ class ZebraLabelPrinter:
         self.zpl_template = None
         self.printer_name = None
         self.usb_available = _USB_AVAILABLE
+        self._recent_labels: list[dict] = []
         
         # Create UI
         self.create_widgets()
@@ -196,6 +197,30 @@ class ZebraLabelPrinter:
         )
         self.status_label.pack()
         
+        # Recent labels (reprint)
+        reprint_frame = tk.LabelFrame(content_frame, text="Recent Labels", padx=10, pady=10)
+        reprint_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.reprint_var = tk.StringVar()
+        self.reprint_dropdown = ttk.Combobox(
+            reprint_frame,
+            textvariable=self.reprint_var,
+            state="readonly",
+            width=35
+        )
+        self.reprint_dropdown.pack(side=tk.LEFT, padx=(0, 10), fill=tk.X, expand=True)
+
+        self.reprint_btn = tk.Button(
+            reprint_frame,
+            text="Reprint",
+            command=self._reprint_label,
+            bg="#F39C12",
+            fg="white",
+            padx=10,
+            state=tk.DISABLED
+        )
+        self.reprint_btn.pack(side=tk.RIGHT)
+
         # Bottom button frame
         bottom_frame = tk.Frame(content_frame)
         bottom_frame.pack(fill=tk.X, pady=(10, 0))
@@ -372,6 +397,15 @@ class ZebraLabelPrinter:
                 text=f"✓ Printed {quantity} label(s) with serial: {serial}",
                 fg="green"
             )
+
+            # Store in recent labels
+            mode = "Text" if text_only else "Template"
+            display = f"{mode}: {serial[:30]}"
+            self._recent_labels.insert(0, {"display": display, "zpl": zpl_code})
+            self._recent_labels = self._recent_labels[:5]
+            self.reprint_dropdown['values'] = [e["display"] for e in self._recent_labels]
+            self.reprint_dropdown.current(0)
+            self.reprint_btn.config(state=tk.NORMAL)
             
             # Clear serial number for next print
             self.serial_entry.delete(0, tk.END)
@@ -424,19 +458,62 @@ For more help, see README.md
             self.template_frame.pack(before=self.serial_frame, fill=tk.X, pady=(0, 15))
             self.serial_frame.config(text="Serial Number")
     
+    def _reprint_label(self):
+        """Reprint the selected recent label (1 copy)"""
+        idx = self.reprint_dropdown.current()
+        if idx < 0 or idx >= len(self._recent_labels):
+            self.status_label.config(text="No label selected to reprint", fg="red")
+            return
+
+        printer = self.printer_var.get()
+        if not printer or printer in ["No printers found", "pywin32 not installed - see README"]:
+            messagebox.showerror("Error", "Please select a valid printer!")
+            return
+
+        entry = self._recent_labels[idx]
+        self.reprint_btn.config(state=tk.DISABLED)
+        self.status_label.config(text="Reprinting...", fg="blue")
+        self.root.update()
+
+        try:
+            self.send_to_usb_printer(entry["zpl"], printer)
+            self.status_label.config(
+                text=f"✓ Reprinted 1 label: {entry['display']}",
+                fg="green"
+            )
+        except Exception as e:
+            self.status_label.config(text=f"Error: {str(e)}", fg="red")
+            messagebox.showerror("Print Error", str(e))
+        finally:
+            self.reprint_btn.config(state=tk.NORMAL)
+
     def _generate_text_only_zpl(self, text):
         """Generate ZPL for a plain text label (38x19mm at 300 dpi)"""
-        # 38x19mm at 300 dpi = 449x224 dots
-        # Text along the long dimension (38mm), centered on label
-        # ^A0N = normal orientation, font 70 dots tall (~6mm)
-        # ^FO0,77 vertically centers 70-dot text in 224 dots: (224-70)/2 = 77
+        # 38x19mm at 300 dpi = 449 wide x 224 tall
+        pw, ll = 449, 224
+        
+        # Choose font size and line count based on text length
+        # At font width W, approx chars per line = pw / W
+        text_len = len(text)
+        if text_len <= 6:
+            font_h, font_w, max_lines = 70, 70, 1
+        elif text_len <= 14:
+            font_h, font_w, max_lines = 50, 50, 2
+        else:
+            font_h, font_w, max_lines = 36, 36, 3
+        
+        # Vertically center the text block
+        block_height = max_lines * font_h
+        y_offset = max((ll - block_height) // 2, 0)
+        
         return (
             "^XA\n"
             "^MMT\n"
-            "^PW449\n"
-            "^LL0224\n"
+            f"^PW{pw}\n"
+            f"^LL0{ll}\n"
             "^LS0\n"
-            f"^FO0,77^A0N,70,70^FB449,1,0,C^FH\\^FD{text}^FS\n"
+            f"^FO0,{y_offset}^A0N,{font_h},{font_w}"
+            f"^FB{pw},{max_lines},0,C^FH\\^FD{text}^FS\n"
             "^PQ1,0,1,Y^XZ"
         )
 
