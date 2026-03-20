@@ -1,0 +1,7 @@
+# Python dependencies for Zebra Label Printer GUI
+# Install with: pip install -r requirements.txt
+
+# Required for USB printing on Windows
+pywin32
+
+# Note: tkinter is included with Python (no separate install needed)
