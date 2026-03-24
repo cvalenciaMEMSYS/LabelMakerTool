@@ -1,24 +1,35 @@
 ﻿# MEMSYS Label Printer Tool
 
-A Windows GUI application for printing MEMSYS sensor labels via USB to a Zebra thermal printer.
+A cross-platform GUI application for printing MEMSYS sensor labels via USB to a Zebra thermal printer. Works on Windows and Linux (including Raspberry Pi).
 
 ## Overview
 
-This tool is designed for the **Zebra ZD421T 300 DPI** thermal transfer printer with **38x19mm labels**. It provides a simple interface for printing serial-numbered sensor labels and plain text labels.
+This tool is designed for the **Zebra ZD421T 300 DPI** thermal transfer printer. It supports two label sizes:
+
+| Product | Label Size | Template File |
+|---------|-----------|---------------|
+| EWS | 38×19mm | `Memsys EWS Zebra label.prn` |
+| Gateway | 57×32mm | `Memsys GW Zebra label.prn` |
 
 ## Features
 
 - **Two printing modes**:
-  - **Template mode**: Load a PRN template file and replace the serial number placeholder (`XXXX-XXXX` pattern)
+  - **Template mode**: Load a PRN template file — serial placeholder is auto-detected from `S/N:` pattern
   - **Text-only mode**: Print dynamic plain text labels with automatic font sizing
+- **Smart placeholder detection**: Automatically finds the serial number placeholder in the ZPL template. Falls back to a visual editor if no `S/N:` pattern is found
+- **Clipboard auto-paste**: Monitors the system clipboard for new serial numbers (8-char → EWS with dash, 6-char → Gateway as-is)
+- **Auto-print**: When enabled, prints one label per new serial number detected on the clipboard
 - Template selection via file browser
 - Serial number entry with placeholder replacement
 - Quantity control (1-999 labels)
 - Printer selection dropdown with refresh capability
-- **Text-only auto-sizing**:
-  - 6 characters or less: large font, 1 line
-  - 7-14 characters: medium font, 2 lines
-  - 15+ characters: small font, 3 lines
+- **Text-only auto-sizing** (word-aware):
+  - Each word prints on its own centered line
+  - Font size based on longest word: ≤10 chars → large, 11-12 → medium, 13+ → small
+  - Up to 3 lines
+- **Reprint**: quick reprint of the last 5 labels from dropdown
+- **Label size detection**: auto-reads template dimensions and prompts for confirmation
+- **Cross-platform**: Windows (win32print) and Linux/RPi (CUPS)
 - Immediate printing (no confirmation dialogs)
 - Keyboard shortcut: Press Enter to print
 - Status feedback in the interface
@@ -33,24 +44,41 @@ Before using this tool, the Zebra printer drivers must be installed:
 4. **Verify installation**: The printer should appear in Windows **Devices and Printers**
 5. **Ready to use**: Launch this tool and select the printer from the dropdown
 
+## Swapping Label Rolls
+
+When switching between label sizes (e.g. EWS 38×19mm ↔ Gateway 57×32mm):
+
+1. **Open the cover** — pull the latch forward to release
+2. **Open the yellow media guides** — they are spring-loaded
+3. **Remove the current roll** and insert the new one between the guides
+4. **Release the guides** — they self-center on the new roll
+5. **Feed labels** through the media path and under the printhead
+6. **Check the feed sensor** — the yellow square under the printhead must be centered on the labels
+7. **Close the cover**
+8. **Calibrate** — press and hold **PAUSE + CANCEL** for 2 seconds. The printer feeds several labels and auto-detects the new size
+9. **Print a test label** to confirm alignment
+
+> When loading a template, the app detects the label dimensions and asks you to confirm the correct labels are loaded.
+
 ## Supported Label Types
 
-| Label Type | Mode | Status |
-|------------|------|--------|
-| EWS labels | Template (PRN with serial number) | Supported |
-| Simple text labels | Text-only mode | Supported |
-| Gateway labels | Template | Planned |
-| Ethernet connectivity | - | Planned |
+| Label Type | Label Size | Mode | Status |
+|------------|-----------|------|--------|
+| EWS labels | 38×19mm | Template (PRN with serial number) | Supported |
+| Gateway labels | 57×32mm | Template (PRN with serial number) | Supported |
+| Simple text labels | Any | Text-only mode | Supported |
+| Ethernet connectivity | - | - | Planned |
 
 ## Installation
 
 ### Requirements
 
-- Windows OS
 - Python 3.8+
 - Zebra ZD421T printer with drivers installed
+- **Windows**: `pywin32` for printer access
+- **Linux / Raspberry Pi**: `pycups` and CUPS service running
 
-### Setup
+### Setup (Windows)
 
 1. (Recommended) Create a virtual environment:
    ```
@@ -68,16 +96,47 @@ Before using this tool, the Zebra printer drivers must be installed:
    python zebra_print_gui.py
    ```
 
+### Setup (Linux / Raspberry Pi)
+
+1. Install CUPS and development headers:
+   ```bash
+   sudo apt install cups libcups2-dev
+   ```
+
+2. Add the Zebra printer as a **Raw Queue** in CUPS:
+   ```bash
+   sudo lpadmin -p ZebraZD421 -E -v usb://Zebra/ZD421 -m raw
+   ```
+   (Adjust the URI — use `lpinfo -v` to find the correct USB path.)
+
+3. (Recommended) Create a virtual environment:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+4. Install dependencies:
+   ```bash
+   pip install pycups
+   ```
+
+5. Run the application:
+   ```bash
+   python3 zebra_print_gui.py
+   ```
+
 ## Usage
 
-### Printing with a Template (EWS Labels)
+### Printing with a Template (EWS / Gateway Labels)
 
-1. Click **Browse** and select your PRN template file
-2. Enter the serial number (replaces `XXXX-XXXX` in the template)
-3. Set the quantity
-4. Select the printer from the dropdown
-5. Click **PRINT LABELS** or press **Enter**
-6. Check the status field for confirmation
+1. Click **Browse** and select your PRN template file (`Memsys EWS Zebra label.prn` or `Memsys GW Zebra label.prn`)
+2. The app detects the label size and asks you to confirm the correct labels are loaded
+3. The serial placeholder is auto-detected from the `S/N:` pattern
+4. Enter the serial number
+5. Set the quantity
+5. Select the printer from the dropdown
+6. Click **PRINT LABELS** or press **Enter**
+7. Check the status field for confirmation
 
 ### Printing Text-Only Labels
 
@@ -87,7 +146,23 @@ Before using this tool, the Zebra printer drivers must be installed:
 4. Select the printer
 5. Click **PRINT LABELS** or press **Enter**
 
-Text is automatically sized based on length for optimal readability on the 38x19mm label.
+Text is automatically sized based on word length for optimal readability.
+
+### Reprinting a Recent Label
+
+1. Select a label from the **Recent Labels** dropdown (stores last 5 prints)
+2. Click **Reprint** to send a single identical copy to the printer
+
+### Auto-Paste and Auto-Print
+
+1. Enable **Auto-paste from clipboard** — the app watches the clipboard every 500ms
+2. Copy a serial number in another application:
+   - **8 characters** (e.g. `ABCD1234`) → auto-formatted as `ABCD-1234` (EWS)
+   - **6 characters** (e.g. `ABC123`) → pasted as-is (Gateway)
+3. The serial number auto-fills the entry field (only when empty)
+4. Optionally enable **Auto-print on paste** — prints one label per new serial automatically
+   - Duplicate guard: same serial copied twice only prints once
+   - Entry clears after printing, ready for the next serial
 
 ## Troubleshooting
 
@@ -107,9 +182,9 @@ Text is automatically sized based on length for optimal readability on the 38x19
 
 ### Wrong serial number on labels
 
-- Template files use `XXXX-XXXX` as the placeholder pattern
-- Ensure your PRN template contains this exact placeholder
-- The serial number you enter replaces all occurrences of `XXXX-XXXX`
+- The app auto-detects the serial placeholder from the `S/N:` pattern in the template
+- If no `S/N:` is found, a viewer opens to let you select the placeholder text manually
+- If the template has `S/N:` with no text after it, the serial is inserted directly after the colon
 
 ### Text-only labels look wrong
 
@@ -121,3 +196,4 @@ Text is automatically sized based on length for optimal readability on the 38x19
 
 - `tkinter` - GUI framework (included with Python)
 - `pywin32` - Windows printer communication via USB
+- `pycups` - Linux printer communication via CUPS (alternative to pywin32)

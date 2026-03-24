@@ -5,17 +5,37 @@ Simple graphical interface for printing labels with custom serial numbers
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 
-try:
-    import win32print  # type: ignore[import-untyped]
-    _USB_AVAILABLE = True
-except ImportError:
-    win32print = None  # type: ignore[assignment]
-    _USB_AVAILABLE = False
+# Platform-specific printing backends
+_PLATFORM = "unsupported"
+win32print = None
+cups = None
+
+if sys.platform == "win32":
+    try:
+        import win32print  # type: ignore[import-untyped,no-redef]
+        _PLATFORM = "windows"
+    except ImportError:
+        pass
+elif sys.platform.startswith("linux"):
+    try:
+        import cups  # type: ignore[import-untyped,no-redef]
+        _PLATFORM = "linux"
+    except ImportError:
+        pass
+
+_INVALID_PRINTERS = {
+    "No printers found",
+    "pywin32 not installed - see README",
+    "pycups not installed - see README",
+    "Unsupported platform",
+}
 
 
 class ZebraLabelPrinter:
@@ -32,8 +52,13 @@ class ZebraLabelPrinter:
         self.prn_file = "Memsys_Zebra_label.prn"
         self.zpl_template = None
         self.printer_name = None
-        self.usb_available = _USB_AVAILABLE
+        self.usb_available = _PLATFORM != "unsupported"
         self._recent_labels: list[dict] = []
+        self._serial_placeholder: str | None = None
+        self._serial_insert_pos: int | None = None
+        self._last_clipboard = ""
+        self._last_printed_serial = ""
+        self._clipboard_poll_id: str | None = None
         
         # Create UI
         self.create_widgets()
@@ -79,6 +104,34 @@ class ZebraLabelPrinter:
         )
         self.text_only_check.pack(side=tk.LEFT)
         
+        # Auto-paste from clipboard
+        auto_frame = tk.Frame(content_frame)
+        auto_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.auto_paste_var = tk.BooleanVar(value=False)
+        self.auto_paste_check = tk.Checkbutton(
+            auto_frame,
+            text="Auto-paste from clipboard",
+            variable=self.auto_paste_var,
+            command=self._on_auto_paste_toggle,
+            font=("Arial", 10)
+        )
+        self.auto_paste_check.pack(side=tk.LEFT)
+
+        # Auto-print on paste (indented under auto-paste)
+        auto_print_frame = tk.Frame(content_frame)
+        auto_print_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.auto_print_var = tk.BooleanVar(value=False)
+        self.auto_print_check = tk.Checkbutton(
+            auto_print_frame,
+            text="    Auto-print on paste (1 label per new serial)",
+            variable=self.auto_print_var,
+            font=("Arial", 9),
+            state=tk.DISABLED
+        )
+        self.auto_print_check.pack(side=tk.LEFT)
+
         # Template selection
         self.template_frame = tk.LabelFrame(content_frame, text="Label Template", padx=10, pady=10)
         self.template_frame.pack(fill=tk.X, pady=(0, 15))
@@ -235,6 +288,26 @@ class ZebraLabelPrinter:
         )
         help_btn.pack(side=tk.RIGHT)
     
+    def _detect_label_size(self, zpl_code: str) -> tuple[int, int] | None:
+        """Determine label size in mm. Uses filename override for EWS templates,
+        otherwise parses ^PW and ^LL from ZPL (at 300 DPI)."""
+        # EWS-only templates have a known size (PRN dimensions are slightly off)
+        name = os.path.basename(self.prn_file).upper()
+        has_ews = "EWS" in name
+        has_gw = "GW" in name or "GATEWAY" in name
+        if has_ews and not has_gw:
+            return (38, 19)
+
+        pw_match = re.search(r'\^PW(\d+)', zpl_code)
+        ll_match = re.search(r'\^LL0?(\d+)', zpl_code)
+        if pw_match and ll_match:
+            pw_dots = int(pw_match.group(1))
+            ll_dots = int(ll_match.group(1))
+            width_mm = round(pw_dots / 11.811)
+            height_mm = round(ll_dots / 11.811)
+            return (width_mm, height_mm)
+        return None
+
     def load_template(self):
         """Load the ZPL template from PRN file"""
         if not os.path.exists(self.prn_file):
@@ -246,8 +319,23 @@ class ZebraLabelPrinter:
             with open(self.prn_file, 'r', encoding='utf-8-sig') as f:
                 self.zpl_template = f.read()
             display_name = os.path.basename(self.prn_file)
+            size = self._detect_label_size(self.zpl_template)
+            if size:
+                display_name += f"  ({size[0]}×{size[1]}mm)"
             self.template_label.config(text=display_name, fg="#27AE60")
             self.status_label.config(text=f"Template loaded: {self.prn_file}", fg="green")
+            
+            # Detect serial placeholder
+            self._serial_insert_pos = None
+            self._serial_placeholder = self._detect_serial_placeholder(self.zpl_template)
+            if self._serial_placeholder is None:
+                self._serial_placeholder = self._show_placeholder_editor(
+                    self.zpl_template
+                )
+                if self._serial_placeholder is None:
+                    self.status_label.config(
+                        text="Warning: No serial placeholder defined", fg="orange"
+                    )
             return True
         except Exception as e:
             self.template_label.config(text="Load error", fg="#E74C3C")
@@ -263,25 +351,47 @@ class ZebraLabelPrinter:
         
         if filename:
             self.prn_file = filename
-            self.load_template()
+            if self.load_template() and self.zpl_template:
+                size = self._detect_label_size(self.zpl_template)
+                if size:
+                    confirm = messagebox.askyesno(
+                        "Confirm Label Size",
+                        f"This template is designed for {size[0]}×{size[1]}mm labels.\n\n"
+                        "Are the correct labels loaded in the printer?"
+                    )
+                    if not confirm:
+                        self.status_label.config(
+                            text="Swap labels and reload template when ready",
+                            fg="orange"
+                        )
     
     def refresh_printers(self):
-        """Refresh the list of available USB printers"""
+        """Refresh the list of available printers"""
         if not self.usb_available:
-            self.printer_dropdown['values'] = ["pywin32 not installed - see README"]
-            self.status_label.config(
-                text="Install pywin32: pip install pywin32",
-                fg="red"
-            )
+            if sys.platform == "win32":
+                msg = "pywin32 not installed - see README"
+                hint = "Install pywin32: pip install pywin32"
+            elif sys.platform.startswith("linux"):
+                msg = "pycups not installed - see README"
+                hint = "Install pycups: pip install pycups"
+            else:
+                msg = "Unsupported platform"
+                hint = "Windows or Linux required for printing"
+            self.printer_dropdown['values'] = [msg]
+            self.status_label.config(text=hint, fg="red")
             return
-        
-        assert win32print is not None
+
         try:
-            # Get list of all printers
             printers = []
-            for printer_info in win32print.EnumPrinters(2):
-                printers.append(printer_info[2])
-            
+            if _PLATFORM == "windows":
+                assert win32print is not None
+                for printer_info in win32print.EnumPrinters(2):
+                    printers.append(printer_info[2])
+            elif _PLATFORM == "linux":
+                assert cups is not None
+                conn = cups.Connection()
+                printers = list(conn.getPrinters().keys())
+
             if not printers:
                 self.printer_dropdown['values'] = ["No printers found"]
                 self.status_label.config(text="No printers found", fg="red")
@@ -289,13 +399,23 @@ class ZebraLabelPrinter:
                 self.printer_dropdown['values'] = printers
                 # Select default printer
                 try:
-                    default = win32print.GetDefaultPrinter()
-                    self.printer_var.set(default)
+                    if _PLATFORM == "windows":
+                        assert win32print is not None
+                        default = win32print.GetDefaultPrinter()
+                        self.printer_var.set(default)
+                    elif _PLATFORM == "linux":
+                        assert cups is not None
+                        conn = cups.Connection()
+                        default = conn.getDefault()
+                        if default and default in printers:
+                            self.printer_var.set(default)
+                        else:
+                            self.printer_var.set(printers[0])
                 except Exception:
                     self.printer_var.set(printers[0])
-                
+
                 self.status_label.config(text=f"Found {len(printers)} printer(s)", fg="green")
-        
+
         except Exception as e:
             self.status_label.config(text=f"Error getting printers: {e}", fg="red")
     
@@ -313,39 +433,272 @@ class ZebraLabelPrinter:
     
     def replace_serial_number(self, zpl_code, new_serial):
         """Replace the serial number placeholder in the ZPL code"""
-        # Replace XXXX-XXXX placeholder with the new serial number
-        modified_zpl = zpl_code.replace('XXXX-XXXX', new_serial)
-        return modified_zpl
+        if self._serial_insert_pos is not None:
+            # Index-based insertion (user clicked a position in the editor)
+            pos = self._serial_insert_pos
+            return zpl_code[:pos] + new_serial + zpl_code[pos:]
+        if self._serial_placeholder == "":
+            # Insertion mode: serial goes right after S/N:
+            return zpl_code.replace("S/N:", f"S/N:{new_serial}")
+        if self._serial_placeholder:
+            return zpl_code.replace(self._serial_placeholder, new_serial)
+        return zpl_code
+
+    def _detect_serial_placeholder(self, zpl_code: str) -> str | None:
+        """Detect serial number placeholder from S/N: pattern in ZPL.
+        Returns the placeholder string, empty string for insertion mode,
+        or None if no S/N: found at all."""
+        # Try explicit placeholder (e.g. S/N:XXXX-XXXX)
+        match = re.search(r'S/N:(.+?)(?:\^FS|\^)', zpl_code)
+        if match:
+            return match.group(1)
+        # Check if S/N: exists with nothing after it (insertion mode)
+        if re.search(r'S/N:\^', zpl_code):
+            return ""
+        return None
+
+    def _show_placeholder_editor(self, zpl_code: str) -> str | None:
+        """Show ZPL content and let user select text or click to set insertion point."""
+        result: list[str | None] = [None]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Select Serial Number Placeholder")
+        dlg.geometry("650x600")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        tk.Label(
+            dlg,
+            text=(
+                "No S/N: placeholder detected in this template.\n\n"
+                "Option 1: Highlight text to replace, then click 'Replace Selection'\n"
+                "Option 2: Click where the serial should be inserted, then click 'Insert Here'"
+            ),
+            font=("Arial", 10),
+            justify=tk.LEFT,
+            padx=10, pady=10
+        ).pack(fill=tk.X)
+
+        # Scrollable text widget showing ZPL
+        text_frame = tk.Frame(dlg)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        scrollbar = tk.Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        text_widget = tk.Text(
+            text_frame,
+            wrap=tk.NONE,
+            font=("Consolas", 10),
+            yscrollcommand=scrollbar.set
+        )
+        text_widget.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_widget.yview)
+
+        text_widget.insert(tk.END, zpl_code)
+
+        # Cursor position label
+        pos_label = tk.Label(dlg, text="Cursor: —", font=("Arial", 9), fg="#555")
+        pos_label.pack(pady=(5, 0))
+
+        def update_pos_label(event=None):
+            idx = text_widget.index(tk.INSERT)
+            # Convert tkinter index "line.col" to flat character offset
+            line, col = map(int, idx.split("."))
+            pos_label.config(text=f"Cursor: line {line}, col {col}")
+
+        text_widget.bind("<ButtonRelease-1>", update_pos_label)
+        text_widget.bind("<KeyRelease>", update_pos_label)
+
+        # Buttons
+        btn_frame = tk.Frame(dlg, pady=10)
+        btn_frame.pack(fill=tk.X)
+
+        def on_replace_selection():
+            try:
+                sel = text_widget.selection_get()
+                if sel.strip():
+                    result[0] = sel
+                    self._serial_insert_pos = None
+                else:
+                    raise tk.TclError("empty")
+            except tk.TclError:
+                messagebox.showwarning(
+                    "No Selection",
+                    "Please highlight the placeholder text first.",
+                    parent=dlg
+                )
+                return
+            dlg.destroy()
+
+        def on_insert_here():
+            # Convert tkinter text index to flat character offset
+            idx = text_widget.index(tk.INSERT)
+            line, col = map(int, idx.split("."))
+            # Count characters up to that line and column
+            flat_pos = 0
+            for i in range(1, line):
+                line_text = text_widget.get(f"{i}.0", f"{i}.end")
+                flat_pos += len(line_text) + 1  # +1 for newline
+            flat_pos += col
+            self._serial_insert_pos = flat_pos
+            result[0] = ""  # empty string signals insertion mode
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        tk.Button(
+            btn_frame, text="Replace Selection",
+            command=on_replace_selection, bg="#27AE60", fg="white",
+            font=("Arial", 10, "bold"), padx=15
+        ).pack(side=tk.LEFT, padx=(20, 10))
+
+        tk.Button(
+            btn_frame, text="Insert Here",
+            command=on_insert_here, bg="#3498DB", fg="white",
+            font=("Arial", 10, "bold"), padx=15
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Button(
+            btn_frame, text="Cancel",
+            command=on_cancel, bg="#E74C3C", fg="white",
+            font=("Arial", 10), padx=15
+        ).pack(side=tk.LEFT)
+
+        self.root.wait_window(dlg)
+        return result[0]
+
+    def _on_auto_paste_toggle(self):
+        """Start or stop clipboard polling."""
+        if self.auto_paste_var.get():
+            self._last_clipboard = ""
+            self._check_clipboard()
+            self.auto_print_check.config(state=tk.NORMAL)
+        else:
+            if self._clipboard_poll_id:
+                self.root.after_cancel(self._clipboard_poll_id)
+                self._clipboard_poll_id = None
+            self.auto_print_var.set(False)
+            self.auto_print_check.config(state=tk.DISABLED)
+
+    def _check_clipboard(self):
+        """Poll clipboard for serial number patterns."""
+        if not self.auto_paste_var.get():
+            return
+        try:
+            clip = self.root.clipboard_get().strip()
+        except tk.TclError:
+            clip = ""
+
+        if clip and clip != self._last_clipboard and clip.isalnum():
+            self._last_clipboard = clip
+            serial = None
+            if len(clip) == 8:
+                serial = f"{clip[:4]}-{clip[4:]}"
+            elif len(clip) == 6:
+                serial = clip
+
+            if serial and not self.serial_entry.get().strip():
+                self.serial_entry.delete(0, tk.END)
+                self.serial_entry.insert(0, serial)
+                self.status_label.config(text=f"Auto-pasted: {serial}", fg="blue")
+
+                if (self.auto_print_var.get()
+                        and serial != self._last_printed_serial):
+                    self._auto_print_one(serial)
+
+        self._clipboard_poll_id = self.root.after(500, self._check_clipboard)
+
+    def _auto_print_one(self, serial: str):
+        """Auto-print a single label for the given serial."""
+        text_only = self.text_only_var.get()
+        if not text_only and not self.zpl_template:
+            self.status_label.config(
+                text="Auto-print skipped: no template loaded", fg="orange"
+            )
+            return
+
+        printer = self.printer_var.get()
+        if not printer or printer in _INVALID_PRINTERS:
+            self.status_label.config(
+                text="Auto-print skipped: no printer selected", fg="orange"
+            )
+            return
+
+        try:
+            if text_only:
+                zpl_code = self._generate_text_only_zpl(serial)
+            else:
+                zpl_code = self.replace_serial_number(self.zpl_template, serial)
+
+            self.send_to_usb_printer(zpl_code, printer)
+            self._last_printed_serial = serial
+            self.status_label.config(
+                text=f"Auto-printed 1 label: {serial}", fg="green"
+            )
+
+            # Store in recent labels
+            mode = "Text" if text_only else "Template"
+            display = f"{mode}: {serial[:30]}"
+            self._recent_labels.insert(0, {"display": display, "zpl": zpl_code})
+            self._recent_labels = self._recent_labels[:5]
+            self.reprint_dropdown['values'] = [
+                e["display"] for e in self._recent_labels
+            ]
+            self.reprint_dropdown.current(0)
+            self.reprint_btn.config(state=tk.NORMAL)
+
+            # Clear entry for next serial
+            self.serial_entry.delete(0, tk.END)
+        except Exception as e:
+            self.status_label.config(
+                text=f"Auto-print error: {e}", fg="red"
+            )
     
     def send_to_usb_printer(self, zpl_code, printer_name):
-        """Send ZPL code to USB printer"""
+        """Send ZPL code to printer (Windows via win32print, Linux via CUPS)"""
         if not self.usb_available:
-            raise Exception("pywin32 not installed. Install with: pip install pywin32")
-        
-        assert win32print is not None
-        try:
-            # Open printer
-            hPrinter = win32print.OpenPrinter(printer_name)
-            
+            raise Exception(
+                "No printing backend available. "
+                "Windows: pip install pywin32 | Linux: pip install pycups"
+            )
+
+        if _PLATFORM == "windows":
+            assert win32print is not None
             try:
-                # Start a print job
-                hJob = win32print.StartDocPrinter(hPrinter, 1, ("Label", "", "RAW"))
-                win32print.StartPagePrinter(hPrinter)
-                
-                # Send ZPL
-                win32print.WritePrinter(hPrinter, zpl_code.encode('utf-8'))
-                
-                # End the job
-                win32print.EndPagePrinter(hPrinter)
-                win32print.EndDocPrinter(hPrinter)
-                
-                return True
-                
-            finally:
-                win32print.ClosePrinter(hPrinter)
-        
-        except Exception as e:
-            raise Exception(f"Print error: {str(e)}")
+                hPrinter = win32print.OpenPrinter(printer_name)
+                try:
+                    win32print.StartDocPrinter(hPrinter, 1, ("Label", "", "RAW"))
+                    win32print.StartPagePrinter(hPrinter)
+                    win32print.WritePrinter(hPrinter, zpl_code.encode('utf-8'))
+                    win32print.EndPagePrinter(hPrinter)
+                    win32print.EndDocPrinter(hPrinter)
+                    return True
+                finally:
+                    win32print.ClosePrinter(hPrinter)
+            except Exception as e:
+                raise Exception(f"Print error: {str(e)}")
+
+        elif _PLATFORM == "linux":
+            assert cups is not None
+            try:
+                conn = cups.Connection()
+                # Write ZPL to temp file — CUPS printFile needs a path
+                with tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.zpl', delete=False
+                ) as tmp:
+                    tmp.write(zpl_code)
+                    tmp_path = tmp.name
+                try:
+                    conn.printFile(
+                        printer_name, tmp_path, "Label", {"raw": ""}
+                    )
+                    return True
+                finally:
+                    os.unlink(tmp_path)
+            except Exception as e:
+                raise Exception(f"CUPS print error: {str(e)}")
     
     def print_label(self):
         """Main print function"""
@@ -366,7 +719,7 @@ class ZebraLabelPrinter:
         
         # Validate printer selected
         printer = self.printer_var.get()
-        if not printer or printer in ["No printers found", "pywin32 not installed - see README"]:
+        if not printer or printer in _INVALID_PRINTERS:
             messagebox.showerror("Error", "Please select a valid printer!")
             return
         
@@ -421,30 +774,58 @@ class ZebraLabelPrinter:
     
     def show_help(self):
         """Show help dialog"""
-        help_text = """MEMSYS Zebra Label Printer - Help
+        help_text = """MEMSYS Zebra Label Printer — Help
 
-How to Use:
-1. Select your Zebra printer from the dropdown
-2. Enter the serial number
-3. Set the quantity (default: 1)
-4. Click "PRINT LABELS" or press Enter
+── LABEL TYPES ──
+• EWS labels: 38×19mm — use "Memsys EWS Zebra label.prn"
+• Gateway labels: 57×32mm — use "Memsys GW Zebra label.prn"
+• Text-only: any text, auto-sized (no template needed)
 
-Keyboard Shortcuts:
-- Enter: Print label
-- +/-: Increase/decrease quantity
+── HOW TO USE ──
+Template mode:
+  1. Click Browse and select a .prn template
+  2. Confirm the correct label size is loaded
+  3. Serial placeholder is auto-detected from S/N: pattern
+  4. Enter the serial number
+  5. Set quantity and click PRINT LABELS (or Enter)
 
-Requirements:
-- Python 3.6+
-- pywin32 (install with: pip install pywin32)
-- Zebra printer installed in Windows
-- PRN template file
+Text-only mode:
+  1. Check "Text-only label" checkbox
+  2. Type your text — each word prints on its own line
+  3. Set quantity and click PRINT LABELS (or Enter)
 
-Troubleshooting:
-- No printers listed: Install pywin32
-- Template not found: Click "Load Template File"
-- Print fails: Check printer is on and connected
+── AUTO-PASTE & AUTO-PRINT ──
+  1. Enable "Auto-paste from clipboard"
+  2. Copy a serial in any app:
+     • 8 chars (ABCD1234) → formatted as ABCD-1234 (EWS)
+     • 6 chars (ABC123) → pasted as-is (Gateway)
+  3. Enable "Auto-print on paste" to print 1 label
+     per new serial automatically
 
-For more help, see README.md
+Reprint: Select a recent label from the dropdown
+and click Reprint for a single copy.
+
+── SWAPPING LABEL ROLLS ──
+  1. Open the printer cover (pull latch forward)
+  2. Open the yellow spring-loaded media guides
+  3. Remove the current roll, insert the new one
+  4. Release guides — they self-center the roll
+  5. Feed labels under the printhead
+  6. Verify the yellow feed sensor is centered
+     on the labels (under the printhead)
+  7. Close the cover
+  8. Calibrate: hold PAUSE + CANCEL for 2 sec
+     — printer feeds labels and auto-detects size
+  9. Print a test label to confirm alignment
+
+── TROUBLESHOOTING ──
+• No printers: Install pywin32 (Win) or pycups (Linux)
+• Template not found: Click Browse to select one
+• Print fails: Check printer is on and connected
+• Wrong size: Swap labels and recalibrate (see above)
+• No placeholder found: A viewer opens to select it
+
+For more details, see README_GUI.md
 """
         messagebox.showinfo("Help", help_text)
     
@@ -466,7 +847,7 @@ For more help, see README.md
             return
 
         printer = self.printer_var.get()
-        if not printer or printer in ["No printers found", "pywin32 not installed - see README"]:
+        if not printer or printer in _INVALID_PRINTERS:
             messagebox.showerror("Error", "Please select a valid printer!")
             return
 
