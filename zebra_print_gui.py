@@ -491,29 +491,41 @@ For more help, see README.md
         """Generate ZPL for a plain text label (38x19mm at 300 dpi)"""
         # 38x19mm at 300 dpi = 449 wide x 224 tall
         pw, ll = 449, 224
-        
-        # Choose font size and line count based on text length
-        # At font width W, approx chars per line = pw / W
-        text_len = len(text)
-        if text_len <= 6:
-            font_h, font_w, max_lines = 70, 70, 1
-        elif text_len <= 14:
-            font_h, font_w, max_lines = 50, 50, 2
+
+        words = text.split()
+        longest_word = max(len(w) for w in words) if words else 0
+
+        # Font size based on longest single word
+        if longest_word <= 10:
+            font_h = font_w = 70
+        elif longest_word <= 12:
+            font_h = font_w = 50
         else:
-            font_h, font_w, max_lines = 36, 36, 3
-        
-        # Vertically center the text block
+            font_h = font_w = 36
+
+        # One word per line, capped at 3
+        max_lines = min(len(words), 3) if words else 1
+
+        # Explicit line breaks so each word gets its own centered line
+        # Use separate field commands per word for maximum compatibility
         block_height = max_lines * font_h
         y_offset = max((ll - block_height) // 2, 0)
-        
+
+        field_commands = ""
+        for i, word in enumerate(words[:max_lines]):
+            y = y_offset + i * font_h
+            field_commands += (
+                f"^FO0,{y}^A0N,{font_h},{font_w}"
+                f"^FB{pw},1,0,C^FD{word}^FS\n"
+            )
+
         return (
             "^XA\n"
             "^MMT\n"
             f"^PW{pw}\n"
             f"^LL0{ll}\n"
             "^LS0\n"
-            f"^FO0,{y_offset}^A0N,{font_h},{font_w}"
-            f"^FB{pw},{max_lines},0,C^FH\\^FD{text}^FS\n"
+            f"{field_commands}"
             "^PQ1,0,1,Y^XZ"
         )
 
