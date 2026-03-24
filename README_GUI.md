@@ -76,7 +76,7 @@ When switching between label sizes (e.g. EWS 38×19mm ↔ Gateway 57×32mm):
 - Python 3.8+
 - Zebra ZD421T printer with drivers installed
 - **Windows**: `pywin32` for printer access
-- **Linux / Raspberry Pi**: `pycups` and CUPS service running
+- **Linux / Raspberry Pi**: Either `pycups` (CUPS) or direct USB (zero dependencies)
 
 ### Setup (Windows)
 
@@ -98,6 +98,23 @@ When switching between label sizes (e.g. EWS 38×19mm ↔ Gateway 57×32mm):
 
 ### Setup (Linux / Raspberry Pi)
 
+#### Option A: Direct USB (simplest — no extra packages)
+
+1. Connect the Zebra printer via USB
+2. Add yourself to the `lp` group (one-time):
+   ```bash
+   sudo usermod -a -G lp $USER
+   ```
+3. Log out and back in
+4. Run the application:
+   ```bash
+   python3 zebra_print_gui.py
+   ```
+
+The printer appears as `/dev/usb/lp0` in the dropdown. No CUPS, no pip packages — just Python + USB cable.
+
+#### Option B: Via CUPS (for managed setups)
+
 1. Install CUPS and development headers:
    ```bash
    sudo apt install cups libcups2-dev
@@ -109,18 +126,12 @@ When switching between label sizes (e.g. EWS 38×19mm ↔ Gateway 57×32mm):
    ```
    (Adjust the URI — use `lpinfo -v` to find the correct USB path.)
 
-3. (Recommended) Create a virtual environment:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-4. Install dependencies:
+3. Install pycups:
    ```bash
    pip install pycups
    ```
 
-5. Run the application:
+4. Run the application:
    ```bash
    python3 zebra_print_gui.py
    ```
@@ -196,4 +207,4 @@ Text is automatically sized based on word length for optimal readability.
 
 - `tkinter` - GUI framework (included with Python)
 - `pywin32` - Windows printer communication via USB
-- `pycups` - Linux printer communication via CUPS (alternative to pywin32)
+- `pycups` - Linux printer communication via CUPS (optional — direct USB works without it)

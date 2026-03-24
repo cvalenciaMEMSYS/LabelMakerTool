@@ -26,14 +26,17 @@ if sys.platform == "win32":
 elif sys.platform.startswith("linux"):
     try:
         import cups  # type: ignore[import-untyped,no-redef]
-        _PLATFORM = "linux"
+        _PLATFORM = "linux_cups"
     except ImportError:
-        pass
+        # Fall back to direct USB if /dev/usb/lp* exists
+        if any(Path("/dev/usb/").glob("lp*")):
+            _PLATFORM = "linux_direct"
 
 _INVALID_PRINTERS = {
     "No printers found",
     "pywin32 not installed - see README",
     "pycups not installed - see README",
+    "No USB printer found - see README",
     "Unsupported platform",
 }
 
@@ -372,8 +375,8 @@ class ZebraLabelPrinter:
                 msg = "pywin32 not installed - see README"
                 hint = "Install pywin32: pip install pywin32"
             elif sys.platform.startswith("linux"):
-                msg = "pycups not installed - see README"
-                hint = "Install pycups: pip install pycups"
+                msg = "No USB printer found - see README"
+                hint = "Install pycups or connect printer via USB"
             else:
                 msg = "Unsupported platform"
                 hint = "Windows or Linux required for printing"
@@ -387,10 +390,14 @@ class ZebraLabelPrinter:
                 assert win32print is not None
                 for printer_info in win32print.EnumPrinters(2):
                     printers.append(printer_info[2])
-            elif _PLATFORM == "linux":
+            elif _PLATFORM == "linux_cups":
                 assert cups is not None
                 conn = cups.Connection()
                 printers = list(conn.getPrinters().keys())
+            elif _PLATFORM == "linux_direct":
+                printers = sorted(
+                    str(p) for p in Path("/dev/usb/").glob("lp*")
+                )
 
             if not printers:
                 self.printer_dropdown['values'] = ["No printers found"]
@@ -403,7 +410,7 @@ class ZebraLabelPrinter:
                         assert win32print is not None
                         default = win32print.GetDefaultPrinter()
                         self.printer_var.set(default)
-                    elif _PLATFORM == "linux":
+                    elif _PLATFORM == "linux_cups":
                         assert cups is not None
                         conn = cups.Connection()
                         default = conn.getDefault()
@@ -411,6 +418,8 @@ class ZebraLabelPrinter:
                             self.printer_var.set(default)
                         else:
                             self.printer_var.set(printers[0])
+                    else:
+                        self.printer_var.set(printers[0])
                 except Exception:
                     self.printer_var.set(printers[0])
 
@@ -657,11 +666,11 @@ class ZebraLabelPrinter:
             )
     
     def send_to_usb_printer(self, zpl_code, printer_name):
-        """Send ZPL code to printer (Windows via win32print, Linux via CUPS)"""
+        """Send ZPL code to printer (Windows win32print, Linux CUPS or direct USB)"""
         if not self.usb_available:
             raise Exception(
                 "No printing backend available. "
-                "Windows: pip install pywin32 | Linux: pip install pycups"
+                "Windows: pip install pywin32 | Linux: pip install pycups or connect USB"
             )
 
         if _PLATFORM == "windows":
@@ -680,11 +689,10 @@ class ZebraLabelPrinter:
             except Exception as e:
                 raise Exception(f"Print error: {str(e)}")
 
-        elif _PLATFORM == "linux":
+        elif _PLATFORM == "linux_cups":
             assert cups is not None
             try:
                 conn = cups.Connection()
-                # Write ZPL to temp file — CUPS printFile needs a path
                 with tempfile.NamedTemporaryFile(
                     mode='w', suffix='.zpl', delete=False
                 ) as tmp:
@@ -699,6 +707,19 @@ class ZebraLabelPrinter:
                     os.unlink(tmp_path)
             except Exception as e:
                 raise Exception(f"CUPS print error: {str(e)}")
+
+        elif _PLATFORM == "linux_direct":
+            try:
+                with open(printer_name, 'w') as dev:
+                    dev.write(zpl_code)
+                return True
+            except PermissionError:
+                raise Exception(
+                    f"Permission denied on {printer_name}. "
+                    "Run: sudo usermod -a -G lp $USER  (then log out/in)"
+                )
+            except Exception as e:
+                raise Exception(f"Direct USB error: {str(e)}")
     
     def print_label(self):
         """Main print function"""
