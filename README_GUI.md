@@ -66,7 +66,7 @@ When switching between label sizes (e.g. EWS 38×19mm ↔ Gateway 57×32mm):
 |------------|-----------|------|--------|
 | EWS labels | 38×19mm | Template (PRN with serial number) | Supported |
 | Gateway labels | 57×32mm | Template (PRN with serial number) | Supported |
-| Simple text labels | Any | Text-only mode | Supported |
+| Simple text labels | Any of the above | Text-only mode | Supported |
 | Ethernet connectivity | - | - | Planned |
 
 ## Installation
