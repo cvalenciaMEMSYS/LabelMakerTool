@@ -38,11 +38,12 @@ This tool is designed for the **Zebra ZD421T 300 DPI** thermal transfer printer.
 
 Before using this tool, the Zebra printer drivers must be installed:
 
-1. **Get the drivers**: Download the Zebra ZD421T printer drivers from the company SharePoint drive
+1. **Get the drivers**: Open the Zebra ZD421T printer driver attached in this repo.
 2. **Connect the printer**: Plug in the Zebra ZD421T via USB
 3. **Install drivers**: Run the driver installer while the printer is connected
 4. **Verify installation**: The printer should appear in Windows **Devices and Printers**
-5. **Ready to use**: Launch this tool and select the printer from the dropdown
+5. **Install the required Python packages** (see Installation section below)
+6. **Ready to use**: Launch this tool, select the template if any, and select the printer from the dropdown to print.
 
 ## Swapping Label Rolls
 
